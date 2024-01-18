@@ -2,12 +2,14 @@ import os
 import pandas as pd
 import requests
 from tqdm import tqdm
+from typing import Optional
 
 from utils.ai import retrieve
 
 
-def _download_file(url, filename):
+def _download_file(url: str, filename: str) -> None:
     response = requests.get(url, stream=True, timeout=120)
+    response.raise_for_status()
     total_size_in_bytes = int(response.headers.get("content-length", 0))
     block_size = 1024  # 1 Kibibyte
     progress_bar = tqdm(total=total_size_in_bytes, unit="iB", unit_scale=True)
@@ -20,19 +22,52 @@ def _download_file(url, filename):
         print("ERROR, something went wrong")
 
 
-def download_embeddings(library_name: str) -> pd.DataFrame:
+def download_embeddings(library_name: str, cache_dir: Optional[str] = None, delete: bool = True) -> pd.DataFrame:
     """Downloads all embeddings and loads it up into a dataframe.
 
     Args:
         library_name (str): The library name for which to download the embeddings.
             See https://fleet.so/context for a list of all 1200+.
+
+        cache_dir (Optional[str], optional): The directory to cache the embeddings in.
+
+        delete (bool, optional): Whether to delete the file after reading. Defaults to True.
+            `delete` is ignored when `cache_dir` is not None.
+
+    Returns:
+        pd.DataFrame: A dataframe containing all embeddings.
+
+    Raises:
+        ValueError: If the library name is not found.
     """
     filename = f"libraries_{library_name}.parquet"
     url = f"https://s3.amazonaws.com/library-embeddings/{filename}"
-    _download_file(url, filename)
-    df = pd.read_parquet(filename)
-    os.remove(filename)  # remove the file after reading
-    print(df.head())
+
+    if cache_dir is None:
+        local_filename = filename
+    else:
+        os.makedirs(cache_dir, exist_ok=True)
+        local_filename = os.path.join(cache_dir, filename)
+
+
+    if not os.path.exists(local_filename):
+        try:
+            _download_file(url, local_filename)
+        except requests.exceptions.HTTPError as exc:
+            if exc.response.status_code in {403, 404}:
+                error_message = (
+                    f"library `{library_name}` not found. "
+                    "See https://fleet.so/context for a list of all 1200+."
+                )
+                raise ValueError(error_message) from exc
+            else:
+                raise exc
+
+    df = pd.read_parquet(local_filename)
+
+    if cache_dir is None and delete:
+        os.remove(local_filename)
+
     return df
 
 

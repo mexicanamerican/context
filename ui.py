@@ -3,16 +3,27 @@
 # pylint: disable=W0718
 
 import os
-import openai
 import sys
 import argparse
 import traceback
+from functools import partial
+import sys
+from io import StringIO
+from contextlib import contextmanager
+
 from getpass import getpass
-
 from rich import print as rprint
+try:
+    import panel as pn
+    from panel.io.mime_render import exec_with_return
+except ImportError:
+    raise ImportError(
+        "Panel is not installed. Please install panel using `pip install panel`."
+    )
 
-from utils.utils import print_markdown, print_exception, extract_code_blocks, print_help
-from utils.stream import TextStream
+pn.extension()
+
+from utils.utils import print_markdown, extract_code_blocks, print_help
 from utils.ai import (
     retrieve_context,
     construct_prompt,
@@ -24,8 +35,63 @@ from constants.cli import ARGUMENTS, LIBRARIES, OPENAI_MODELS
 from constants.ai import MODELS_TO_TOKENS
 
 
+def execute(code_blocks, instance, clicks):
+    try:
+        stdout = StringIO()
+        stderr = StringIO()
+        result = exec_with_return(code_blocks, stdout=stdout, stderr=stderr)
+        if result:
+            instance.send(result, user="Fleet Context", avatar="🛩️", respond=False)
+        if stdout.getvalue():
+            instance.send(stdout.getvalue(), user="Fleet Context", avatar="🛩️", respond=False)
+        if stderr.getvalue():
+            instance.send(f"```python\n{stderr.getvalue()}\n```", user="Exception", respond=False)
+    except Exception:
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        instance.send(
+            f"An exception occured. {''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))}",
+            user="Fleet Context",
+            avatar="🛩️", respond=False
+        )
+
+
+def respond(k, filters, model, cite_sources, context_window, contents, user, instance):
+    messages = instance.serialize()
+    rag_context = retrieve_context(contents, k=k, filters=filters)
+    prompts = construct_prompt(
+        messages,
+        rag_context,
+        model=model,
+        cite_sources=cite_sources,
+        context_window=context_window,
+    )
+    try:
+        message = None
+        if model in OPENAI_MODELS:
+            for response in get_remote_chat_response(prompts, model=model):
+                if response:
+                    # airplane emoji
+                    message = instance.stream(
+                        response, message=message, user="Fleet Context", avatar="🛩️")
+        else:
+            for response in get_other_chat_response(prompts, model=model):
+                if response:
+                    message = instance.stream(
+                        response, message=message, user="Fleet Context", avatar="🛩️")
+    finally:
+        if not message.object:
+            return
+
+        # Execute code blocks
+        code_blocks = extract_code_blocks(message.object)
+        if code_blocks:
+            execute_button = pn.widgets.Button(name="Click to execute code", button_type="primary", width=200)
+            partial_execute = partial(execute, code_blocks, instance)
+            pn.bind(partial_execute, execute_button.param.clicks, watch=True)
+            instance.send(execute_button, user="Fleet Context", avatar="🛩️", respond=False)
+
 def main():
-    parser = argparse.ArgumentParser(description="Fleet Data Retriever", add_help=False)
+    parser = argparse.ArgumentParser(description="Fleet Data Retriever UI", add_help=False)
     parser.add_argument("help", nargs="?", default=argparse.SUPPRESS)
 
     # Add arguments
@@ -186,75 +252,11 @@ def main():
         
         """
         )
+    partial_respond = partial(respond, k, filters, model, cite_sources, context_window)
 
-    messages = []
-    while True:
-        try:
-            query = input("> ")
-            query = query.strip()
-
-            if not query:
-                continue
-
-            if query.lower() == "exit":
-                rprint("Exiting. Goodbye!")
-                break
-
-            messages.append({"role": "user", "content": query})
-            rag_context = retrieve_context(query, k=k, filters=filters)
-            prompts = construct_prompt(
-                messages,
-                rag_context,
-                model=model,
-                cite_sources=cite_sources,
-                context_window=context_window,
-            )
-            full_response = ""
-            try:
-                streamer = TextStream()
-                if model in OPENAI_MODELS:
-                    for response in get_remote_chat_response(prompts, model=model):
-                        if response:
-                            full_response += response
-                            streamer.print_stream(full_response)
-                else:
-                    for response in get_other_chat_response(prompts, model=model):
-                        if response:
-                            full_response += response
-                            streamer.print_stream(full_response)
-            finally:
-                streamer.end_stream()
-                rprint("\n")
-
-                # Add to messages
-                messages.append({"role": "assistant", "content": full_response})
-
-                # Execute code blocks
-                code_blocks = extract_code_blocks(full_response)
-                if code_blocks:
-                    while True:
-                        user_response = input("Run code? (y/n): ")
-                        if user_response not in ["y", "n"]:
-                            rprint("Invalid response. Please input 'y' or 'n'.")
-                        elif user_response == "y":
-                            try:
-                                exec(code_blocks)
-                            except Exception:
-                                exc_type, exc_value, exc_traceback = sys.exc_info()
-                                print_exception(exc_type, exc_value, exc_traceback)
-
-                                messages.append(
-                                    {
-                                        "role": "user",
-                                        "content": f"An exception occured. {''.join(traceback.format_exception(exc_type, exc_value, exc_traceback))}",
-                                    }
-                                )
-                            break
-                        else:
-                            break
-        except KeyboardInterrupt:
-            rprint("\nExiting. Goodbye!")
-            break
+    chat_interface = pn.chat.ChatInterface(callback=partial_respond, callback_exception="verbose")
+    template = pn.template.FastListTemplate(main=[chat_interface], title="🛩️ Fleet Context UI", theme_toggle=False)
+    template.show()
 
 
 if __name__ == "__main__":
